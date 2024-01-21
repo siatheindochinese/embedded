@@ -29,7 +29,7 @@ print('COCO-pretrained yolox-nano loaded')
 pipeline = rs.pipeline()
 config = rs.config()
 
-width, height = 640, 480
+width, height = 1280, 720
 config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, 30)
 
 print('Realsense camera stream loaded')
@@ -77,6 +77,7 @@ with torch.no_grad():
 							  exp.test_conf,
 							  exp.nmsthre,
 							  class_agnostic=True)
+		
 		if outputs[0] is not None:
 			output = outputs[0].cpu()
 			output = output[output[:, 6] == 0] # filter out ONLY persons
@@ -94,17 +95,11 @@ with torch.no_grad():
 					online_tlwhs.append(tlwh)
 					online_ids.append(tid)
 					online_scores.append(t.score)
+			# Plot BYTETracker output
+			# print(online_tlwhs) use this to get scrops for tracked object
 			vis_res = plot_tracking(img_ori,
 									  online_tlwhs,
 									  online_ids)
-			
-			'''
-			cls = output[:, 6]
-			bboxes = output[:, 0:4]
-			bboxes /= ratio
-			scores = output[:, 4] * output[:, 5]
-			vis_res = vis(img_ori, bboxes, scores, cls, 0.35, COCO_CLASSES)
-			'''
 		else:
 			vis_res = img_ori
 
