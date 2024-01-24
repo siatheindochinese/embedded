@@ -12,7 +12,7 @@ from yolox.utils import postprocess, vis
 from yolox.utils.visualize import plot_tracking
 
 # import BYTETracker
-from src.byte_tracker import BYTETracker
+from bytetrack import BYTETracker
 
 # load yolox model and weights here
 # COMMENT: these parameters are hardcoded we might wanna offload
