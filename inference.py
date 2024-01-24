@@ -3,27 +3,35 @@ import numpy as np
 import cv2
 import torch
 
-# import YOLOX functions and attributes
-from yolox.exp import get_exp
+#import YOLOX functions and attributes
+# NOTE: find a way to remove redundant yolo files and keep yolox-nano only
+from yolox import yolox_nano
 from yolox.data.data_augment import ValTransform
-from yolox.data.datasets import COCO_CLASSES
-from yolox.utils import fuse_model, get_model_info, postprocess, vis
+#from yolox.data.datasets import COCO_CLASSES
+from yolox.utils import postprocess, vis
 from yolox.utils.visualize import plot_tracking
 
 # import BYTETracker
 from src.byte_tracker import BYTETracker
 
-# load model and weights here
-exp = get_exp(None, 'yolox-nano')
-model = exp.get_model()
+# load yolox model and weights here
+# COMMENT: these parameters are hardcoded we might wanna offload
+#          offload them into a separate config file
+test_size = (512, 512)
+test_conf = 0.01
+nmsthre = 0.65
+num_classes = 80
 
+model = yolox_nano.Exp().get_model()
 ckpt = torch.load('weights/yolox_nano.pth', map_location="cpu")
 model.load_state_dict(ckpt["model"])
-
 model.cuda()
 model.half()
 model.eval()
 print('COCO-pretrained yolox-nano loaded')
+
+# yolox utils
+preproc = ValTransform(legacy=False)
 
 # Configure depth and color streams
 pipeline = rs.pipeline()
@@ -34,10 +42,7 @@ config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, 30)
 
 print('Realsense camera stream loaded')
 
-# yolox utils
-preproc = ValTransform(legacy=False)
-
-# BYTETracker init
+# load BYTETracker
 aspect_ratio_thresh = 0.6
 min_box_area = 10
 track_thresh = 0.5
@@ -63,19 +68,19 @@ with torch.no_grad():
 			continue
 
 		# Convert images to numpy arrays then to torch tensors in GPU
-		img = np.asanyarray(color_frame.get_data())
+		img = np.asanyarray(color_frame.get_data()) #BGR?? RGB?? Double check if channels are correct
 		img_ori = img
-		ratio = min(exp.test_size[0] / height, exp.test_size[1] / width)
+		ratio = min(test_size[0] / height, test_size[1] / width)
 		
-		img, _ = preproc(img, None, exp.test_size)
+		img, _ = preproc(img, None, test_size)
 		img = torch.from_numpy(img).unsqueeze(0).float().half().cuda()
 		
 		# inference
 		outputs = model(img)
 		outputs = postprocess(outputs,
-							  exp.num_classes,
-							  exp.test_conf,
-							  exp.nmsthre,
+							  num_classes,
+							  test_conf,
+							  nmsthre,
 							  class_agnostic=True)
 		
 		if outputs[0] is not None:
@@ -83,7 +88,7 @@ with torch.no_grad():
 			output = output[output[:, 6] == 0] # filter out ONLY persons
 			
 			#BYTETracker
-			online_targets = tracker.update(output, [height, width], exp.test_size)
+			online_targets = tracker.update(output, [height, width], test_size)
 			online_tlwhs = []
 			online_ids = []
 			online_scores = []
@@ -98,8 +103,8 @@ with torch.no_grad():
 			# Plot BYTETracker output
 			# print(online_tlwhs) use this to get scrops for tracked object
 			vis_res = plot_tracking(img_ori,
-									  online_tlwhs,
-									  online_ids)
+									online_tlwhs,
+									online_ids)
 		else:
 			vis_res = img_ori
 
