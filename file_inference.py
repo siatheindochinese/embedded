@@ -5,6 +5,8 @@ import argparse
 import cv2
 import torch
 
+#from multiprocessing import Pool
+
 # import YOLOX functions and attributes
 # NOTE: find a way to remove redundant files
 from yolox import yolox_nano
@@ -105,6 +107,10 @@ vmodel = vificlip.returnCLIP(vconfig,
 vmodel.cuda()
 vmodel.eval()
 vmodel.half()
+'''
+for param in vmodel.parameters():
+	print(param.dtype)
+'''
 
 vckpt = torch.load(vconfig.MODEL.RESUME, map_location='cpu')
 load_state_dict = vckpt['model']
@@ -125,14 +131,72 @@ for k, v in load_state_dict.items():
 
 vmodel.load_state_dict(new_state_dict, strict=False)
 
+#######################################
+# utility functions (to be offloaded) #
+#######################################
+def extract_tracks(global_buffer, local_buffers):
+	vid = np.array(global_buffer.queue)
+	tidlst, bboxlst = zip(*local_buffers.items())
+	def extract_crop(bbox):
+		tlx, tly, brx, bry = bbox.astype(int)
+		crop_vid = vid[:,tly:bry,tlx:brx,:]
+		return crop_vid
+	
+	cropped_clips = dict()
+	for i in range(len(tidlst)):
+		cropped_clips[tidlst[i]] = process_vid(extract_crop(bboxlst[i]))
+	return cropped_clips
+	
+def process_vid(cropped_clip):
+	scale = 224
+	normalized = normalize_vid(cropped_clip)
+	resized = resize_vid(normalized, scale)
+	cropped = centerCrop_vid(resized)
+	torched = toTorchTensor(cropped)
+	return torched
+	# resize
+	# center crop
+	# normalize
+	# format shape to n,c,h,w
+	# convert to torch tensor
+	
+def normalize_vid(cropped_clip, mean=(123.675, 116.28, 103.53), std=(58.395, 57.12, 57.375)):
+	R, G, B = cropped_clip[:,:,:,0], cropped_clip[:,:,:,1], cropped_clip[:,:,:,2]
+	R, G, B = (R - mean[0])/std[0], (G - mean[1])/std[1], (R - mean[2])/std[2]
+	R, G, B = np.expand_dims(R, 3), np.expand_dims(G, 3), np.expand_dims(B, 3)
+	return np.concatenate((R,G,B),axis=3)
+	
+def resize_vid(cropped_clip, scale):
+	n, h, w, _ = cropped_clip.shape
+	if h < w:
+		new_h, new_w = scale, int(w* scale / h)
+	else:
+		new_h, new_w = int(h* scale / w), scale
+	resized_clip = np.array([cv2.resize(cropped_clip[i],(new_w, new_h)) for i in range(n)])
+	return resized_clip
+	
+def centerCrop_vid(cropped_clip):
+	_, h, w, _ = cropped_clip.shape
+	diff = abs(int((h - w)/2))
+	if h < w:
+		centercropped_clip = cropped_clip[:,:,diff:diff+w,:]
+	else:
+		centercropped_clip = cropped_clip[:,diff:diff+w,:,:]
+	return centercropped_clip
+	
+def toTorchTensor(np_clip, gpu=True):
+	t_clip = torch.HalfTensor(np_clip)
+	t_clip = t_clip.permute(0,3,1,2).unsqueeze(0)
+	if gpu:
+		t_clip = t_clip.cuda()
+	return t_clip
+	
 ###################
 # Start streaming #
 ###################
 # init global buffer to collect frames
 global_buffer = Queue(32)
 # init local buffer to collect metadata from each tracked ID
-# COMMENT: choose between limited/unlimited number of local buffers
-#          limited to 20 local buffers for now
 local_buffers = dict()
 
 with torch.no_grad():
@@ -175,6 +239,7 @@ with torch.no_grad():
 					online_ids.append(tid)
 					online_scores.append(t.score)
 					tlbr = tlwh + np.array([0, 0, tlwh[0]+tlwh[2], tlwh[1]+tlwh[3]])
+					# update local buffers with metadata
 					if tid not in local_buffers:
 						local_buffers[tid] = tlbr
 					else:
@@ -187,11 +252,13 @@ with torch.no_grad():
 		global_buffer.put(vis_res)
 
 		if global_buffer.full():
-			print('local buffers')
-			for tid in local_buffers:
-				print(tid, local_buffers.get(tid))
-			print('')
+			cropped_clips = extract_tracks(global_buffer, local_buffers)
 			local_buffers.clear()
+			# ADD ACTION RECOGNITION HERE
+			tmp = cropped_clips.get(list(cropped_clips.keys())[0])
+			with torch.cuda.amp.autocast():
+				_ = vmodel(tmp)
+			
 			while not global_buffer.empty():
 				cv2.imshow('clip', global_buffer.get())
 				cv2.waitKey(1)
