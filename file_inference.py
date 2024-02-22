@@ -61,7 +61,7 @@ preproc = ValTransform(legacy=False)
 cap = cv2.VideoCapture(args.videopath)
 width, height = args.width, args.height
 
-cv2.namedWindow('RealSense', cv2.WINDOW_AUTOSIZE)
+out = cv2.VideoWriter('out.avi', cv2.VideoWriter_fourcc(*'MJPG'), 20.0, (width, height))
 
 ####################
 # load BYTETracker #
@@ -85,7 +85,7 @@ tracker = BYTETracker(track_thresh=track_thresh,
 # COMMENT: these parameters are hardcoded, might wanna offload #
 #          offload them into a separate config file            #
 ################################################################
-class_names = ['punch','kick','walk']
+class_names = ['walk','jump','run']
 
 class parse_option():
     def __init__(self):
@@ -142,9 +142,13 @@ def extract_tracks(global_buffer, local_buffers):
 		crop_vid = vid[:,tly:bry,tlx:brx,:]
 		return crop_vid
 	
-	cropped_clips = dict()
+	cropped_clips = []
 	for i in range(len(tidlst)):
-		cropped_clips[tidlst[i]] = process_vid(extract_crop(bboxlst[i]))
+		tmp = np.expand_dims(process_vid(extract_crop(bboxlst[i])),0)
+		cropped_clips.append(tmp)
+	
+	cropped_clips = np.concatenate(cropped_clips,axis = 0)
+	cropped_clips = torch.HalfTensor(cropped_clips) # B, n, c, h, w
 	return cropped_clips
 	
 def process_vid(cropped_clip):
@@ -152,13 +156,8 @@ def process_vid(cropped_clip):
 	normalized = normalize_vid(cropped_clip)
 	resized = resize_vid(normalized, scale)
 	cropped = centerCrop_vid(resized)
-	torched = toTorchTensor(cropped)
-	return torched
-	# resize
-	# center crop
-	# normalize
-	# format shape to n,c,h,w
-	# convert to torch tensor
+	cropped = nhwc_to_nchw(cropped)
+	return cropped
 	
 def normalize_vid(cropped_clip, mean=(123.675, 116.28, 103.53), std=(58.395, 57.12, 57.375)):
 	R, G, B = cropped_clip[:,:,:,0], cropped_clip[:,:,:,1], cropped_clip[:,:,:,2]
@@ -172,6 +171,7 @@ def resize_vid(cropped_clip, scale):
 		new_h, new_w = scale, int(w* scale / h)
 	else:
 		new_h, new_w = int(h* scale / w), scale
+	
 	resized_clip = np.array([cv2.resize(cropped_clip[i],(new_w, new_h)) for i in range(n)])
 	return resized_clip
 	
@@ -179,17 +179,13 @@ def centerCrop_vid(cropped_clip):
 	_, h, w, _ = cropped_clip.shape
 	diff = abs(int((h - w)/2))
 	if h < w:
-		centercropped_clip = cropped_clip[:,:,diff:diff+w,:]
+		centercropped_clip = cropped_clip[:,:,diff:diff+h,:]
 	else:
 		centercropped_clip = cropped_clip[:,diff:diff+w,:,:]
 	return centercropped_clip
-	
-def toTorchTensor(np_clip, gpu=True):
-	t_clip = torch.HalfTensor(np_clip)
-	t_clip = t_clip.permute(0,3,1,2).unsqueeze(0)
-	if gpu:
-		t_clip = t_clip.cuda()
-	return t_clip
+
+def nhwc_to_nchw(np_clip):
+	return np.transpose(np_clip, (0,3,1,2))
 	
 ###################
 # Start streaming #
@@ -238,31 +234,59 @@ with torch.no_grad():
 					online_tlwhs.append(tlwh)
 					online_ids.append(tid)
 					online_scores.append(t.score)
-					tlbr = tlwh + np.array([0, 0, tlwh[0]+tlwh[2], tlwh[1]+tlwh[3]])
+					tlbr = tlwh + np.array([0, 0, tlwh[0], tlwh[1]])
 					# update local buffers with metadata
 					if tid not in local_buffers:
 						local_buffers[tid] = tlbr
 					else:
 						old_tlbr = local_buffers.get(tid)
+						'''
 						tmpmsk = old_tlbr < tlbr
 						local_buffers[tid][tmpmsk] = tlbr[tmpmsk]
+						'''
+						if tlbr[0] < old_tlbr[0]:
+							old_tlbr[0] = tlbr[0]
+						if tlbr[1] < old_tlbr[1]:
+							old_tlbr[1] = tlbr[1]
+						if tlbr[2] > old_tlbr[2]:
+							old_tlbr[2] = tlbr[2]
+						if tlbr[3] > old_tlbr[3]:
+							old_tlbr[3] = tlbr[3]
+						local_buffers[tid] = old_tlbr
 					vis_res = plot_tracking(img_ori, online_tlwhs, online_ids)
 		else:
 			vis_res = img_ori
 		global_buffer.put(vis_res)
 
 		if global_buffer.full():
-			cropped_clips = extract_tracks(global_buffer, local_buffers)
-			local_buffers.clear()
-			# ADD ACTION RECOGNITION HERE
-			tmp = cropped_clips.get(list(cropped_clips.keys())[0])
+			cropped_clips = extract_tracks(global_buffer, local_buffers).cuda()
+			
+			
 			with torch.cuda.amp.autocast():
-				_ = vmodel(tmp)
+				logits = vmodel(cropped_clips)
+				pred = logits.argmax(1)
+				pred_actions = [class_names[i] for i in pred]
+				print(pred_actions)
+			
 			
 			while not global_buffer.empty():
-				cv2.imshow('clip', global_buffer.get())
+				tmp = global_buffer.get()
+				
+				i = 0
+				for bbox in local_buffers.values():
+					tlx, tly, brx, bry = bbox.astype(int)
+					cv2.rectangle(tmp, (tlx, tly), (brx, bry), (36,255,12), 1)
+					cv2.putText(tmp, pred_actions[i], (tlx, tly-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36,255,12), 2)
+					i += 1
+				
+				cv2.imshow('clip', tmp)
+				out.write(tmp)
 				cv2.waitKey(1)
-		# Only show images if p
+			
+			local_buffers.clear()
+			
 		if cv2.waitKey(1) & 0xff == ord('q'):
 			break
 cap.release()
+out.release()
+cv2.destroyAllWindows() 
